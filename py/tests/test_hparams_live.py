@@ -10,8 +10,8 @@
 
 Logging a run marks its environment on a queue
 (:class:`~visdom.experiments.live.LiveUpdateQueue`); a drain asks
-:func:`~visdom.experiments.live.resolve_targets` which panes that could affect
-and refreshes each through the ``experiments/hparams/update`` handler.
+:func:`~visdom.experiments.live.resolve_targets` which explicit-id panes it
+affects and refreshes each through the ``experiments/hparams/update`` handler.
 
 The two decisions are tested on their own — which panes a change reaches, and
 when a burst of marks turns into a rebuild — and then end to end through a real
@@ -47,10 +47,10 @@ def hparams_window(mode, query=None, env_ids=None):
 class TestResolveTargets(unittest.TestCase):
     """resolve_targets names the panes a set of changed envs could affect."""
 
-    def test_query_pane_is_affected_by_any_change(self):
-        """A query can start matching a run it did not match before."""
+    def test_query_pane_is_not_refreshed_automatically(self):
+        """Refreshing a query would turn every log write into a store scan."""
         state = {"main": {"jsons": {"hp1": hparams_window("query", query="lr < 1")}}}
-        self.assertEqual(resolve_targets(state, {"unrelated"}), [("main", "hp1")])
+        self.assertEqual(resolve_targets(state, {"unrelated"}), [])
 
     def test_env_ids_pane_only_follows_the_runs_it_names(self):
         """An explicit selection cannot grow, so unnamed runs leave it alone."""
@@ -81,8 +81,8 @@ class TestResolveTargets(unittest.TestCase):
         }
         self.assertEqual(resolve_targets(state, {"run-a"}), [])
 
-    def test_both_pane_is_affected_by_any_change(self):
-        """``both`` still holds a query, so it is re-run like any other query."""
+    def test_both_pane_is_not_refreshed_automatically(self):
+        """Even a bounded query is left to an explicit refresh."""
         state = {
             "main": {
                 "jsons": {
@@ -90,7 +90,7 @@ class TestResolveTargets(unittest.TestCase):
                 }
             }
         }
-        self.assertEqual(resolve_targets(state, {"run-b"}), [("main", "hp1")])
+        self.assertEqual(resolve_targets(state, {"run-b"}), [])
 
     def test_other_window_types_are_left_alone(self):
         """Only hparams panes are rebuilt from a selection."""
@@ -99,7 +99,7 @@ class TestResolveTargets(unittest.TestCase):
                 "jsons": {
                     "plot": {"type": "plot", "content": {}},
                     "text": {"type": "text", "content": ""},
-                    "hp1": hparams_window("query", query="lr < 1"),
+                    "hp1": hparams_window("env_ids", env_ids=["run-a"]),
                 }
             }
         }
@@ -118,8 +118,8 @@ class TestResolveTargets(unittest.TestCase):
     def test_panes_across_envs_are_all_named(self):
         """A run can be shown by panes living in several environments."""
         state = {
-            "main": {"jsons": {"hp1": hparams_window("query", query="lr < 1")}},
-            "other": {"jsons": {"hp2": hparams_window("query", query="acc > 0")}},
+            "main": {"jsons": {"hp1": hparams_window("env_ids", env_ids=["run-a"])}},
+            "other": {"jsons": {"hp2": hparams_window("env_ids", env_ids=["run-a"])}},
         }
         self.assertEqual(
             sorted(resolve_targets(state, {"run-a"})),
@@ -156,14 +156,14 @@ class TestLiveUpdateQueue(unittest.TestCase):
         self.resolved = []
         self.rebuilt = []
 
-    def schedule(self, delay, callback):
-        self.scheduled.append((delay, callback))
+    def schedule(self, delay, drain):
+        self.scheduled.append((delay, drain))
 
     def resolve(self, changed):
         self.resolved.append(set(changed))
         return [("main", "hp1")]
 
-    def rebuild(self, eid, win_id):
+    async def rebuild(self, eid, win_id):
         self.rebuilt.append((eid, win_id))
 
     def queue(self, **kwargs):
@@ -171,6 +171,10 @@ class TestLiveUpdateQueue(unittest.TestCase):
         kwargs.setdefault("rebuild", self.rebuild)
         kwargs.setdefault("schedule", self.schedule)
         return LiveUpdateQueue(**kwargs)
+
+    def run_drain(self, index):
+        """Run the drain the queue handed to the scheduler ``index``-th."""
+        asyncio.run(self.scheduled[index][1]())
 
     def test_a_burst_of_marks_costs_one_drain(self):
         """A training loop logging every step must not rebuild every step."""
@@ -180,7 +184,7 @@ class TestLiveUpdateQueue(unittest.TestCase):
         queue.mark("run-b")
 
         self.assertEqual(len(self.scheduled), 1)
-        self.scheduled[0][1]()
+        self.run_drain(0)
         self.assertEqual(self.resolved, [{"run-a", "run-b"}])
         self.assertEqual(self.rebuilt, [("main", "hp1")])
 
@@ -193,32 +197,87 @@ class TestLiveUpdateQueue(unittest.TestCase):
         """The queue re-arms rather than going quiet after its first drain."""
         queue = self.queue()
         queue.mark("run-a")
-        self.scheduled[0][1]()
+        self.run_drain(0)
         queue.mark("run-b")
 
         self.assertEqual(len(self.scheduled), 2)
-        self.scheduled[1][1]()
+        self.run_drain(1)
         self.assertEqual(self.resolved, [{"run-a"}, {"run-b"}])
 
     def test_a_mark_during_a_drain_is_not_swallowed(self):
         """Marks are taken before rebuilding, so a late one opens a new round."""
         queue = self.queue()
 
-        def rebuild_and_mark(eid, win_id):
+        async def rebuild_and_mark(eid, win_id):
             self.rebuilt.append((eid, win_id))
             queue.mark("run-late")
 
         queue._rebuild = rebuild_and_mark
         queue.mark("run-a")
-        self.scheduled[0][1]()
+        self.run_drain(0)
 
         self.assertEqual(len(self.scheduled), 2)
-        self.scheduled[1][1]()
+        self.run_drain(1)
         self.assertEqual(self.resolved, [{"run-a"}, {"run-late"}])
+
+    def test_drains_never_overlap(self):
+        """A mark while a rebuild is parked waits for that drain to finish.
+
+        Arming a second drain straight away would let it rebuild the same pane
+        while the first is still reading, so the round is armed only once the
+        running drain is done.
+        """
+        queue = self.queue()
+
+        async def scenario():
+            parked = asyncio.Event()
+            release = asyncio.Event()
+
+            async def slow_rebuild(eid, win_id):
+                self.rebuilt.append((eid, win_id))
+                parked.set()
+                await release.wait()
+
+            queue._rebuild = slow_rebuild
+            queue.mark("run-a")
+            running = asyncio.ensure_future(self.scheduled[0][1]())
+            await parked.wait()
+
+            queue.mark("run-b")
+            self.assertEqual(len(self.scheduled), 1)
+
+            release.set()
+            await running
+            self.assertEqual(len(self.scheduled), 2)
+
+        asyncio.run(scenario())
+        self.run_drain(1)
+        self.assertEqual(self.resolved, [{"run-a"}, {"run-b"}])
+
+    def test_rebuilds_within_a_drain_run_one_at_a_time(self):
+        """Each rebuild is awaited before the next pane starts."""
+        events = []
+
+        async def rebuild(eid, win_id):
+            events.append(("start", win_id))
+            await asyncio.sleep(0)
+            events.append(("end", win_id))
+
+        queue = self.queue(
+            resolve=lambda changed: [("main", "hp1"), ("main", "hp2")],
+            rebuild=rebuild,
+        )
+        queue.mark("run-a")
+        self.run_drain(0)
+
+        self.assertEqual(
+            events,
+            [("start", "hp1"), ("end", "hp1"), ("start", "hp2"), ("end", "hp2")],
+        )
 
     def test_an_empty_drain_does_nothing(self):
         """A drain with nothing pending must not resolve or rebuild."""
-        self.queue().drain()
+        asyncio.run(self.queue().drain())
         self.assertEqual(self.resolved, [])
         self.assertEqual(self.rebuilt, [])
 
@@ -226,7 +285,7 @@ class TestLiveUpdateQueue(unittest.TestCase):
         """One unbuildable pane must not cost the rest their update."""
         attempted = []
 
-        def rebuild(eid, win_id):
+        async def rebuild(eid, win_id):
             attempted.append(win_id)
             if win_id == "hp1":
                 raise RuntimeError("boom")
@@ -237,7 +296,7 @@ class TestLiveUpdateQueue(unittest.TestCase):
         )
         queue.mark("run-a")
         with self.assertLogs(level="ERROR"):
-            self.scheduled[0][1]()
+            self.run_drain(0)
 
         self.assertEqual(attempted, ["hp1", "hp2"])
 
@@ -250,7 +309,7 @@ class TestLiveUpdateQueue(unittest.TestCase):
         queue = self.queue(resolve=resolve)
         queue.mark("run-a")
         with self.assertLogs(level="ERROR"):
-            self.scheduled[0][1]()
+            self.run_drain(0)
 
         self.assertEqual(self.rebuilt, [])
 
@@ -266,18 +325,18 @@ class TestLiveUpdateQueue(unittest.TestCase):
         queue = self.queue(resolve=resolve)
         queue.mark("run-a")
         with self.assertLogs(level="ERROR"):
-            self.scheduled[0][1]()
+            self.run_drain(0)
 
         failing[0] = False
         queue.mark("run-b")
         self.assertEqual(len(self.scheduled), 2)
-        self.scheduled[1][1]()
+        self.run_drain(1)
         self.assertEqual(self.rebuilt, [("main", "hp1")])
 
     def test_a_failing_schedule_leaves_the_queue_usable(self):
         """A queue that could not arm itself must still arm on the next mark."""
 
-        def schedule(delay, callback):
+        def schedule(delay, drain):
             raise RuntimeError("no loop")
 
         queue = self.queue(schedule=schedule)
@@ -287,14 +346,37 @@ class TestLiveUpdateQueue(unittest.TestCase):
         queue._schedule = self.schedule
         queue.mark("run-b")
         self.assertEqual(len(self.scheduled), 1)
-        self.scheduled[0][1]()
+        self.run_drain(0)
         self.assertEqual(self.resolved, [{"run-a", "run-b"}])
 
-    def test_without_a_scheduler_a_mark_drains_inline(self):
-        """With no loop to defer onto the work still happens, just immediately."""
-        self.queue(schedule=None).mark("run-a")
+    def test_without_a_scheduler_the_drain_runs_on_the_running_loop(self):
+        """The default defers onto the loop the mark was made from."""
+
+        async def scenario():
+            queue = LiveUpdateQueue(
+                resolve=self.resolve, rebuild=self.rebuild, delay=0.01
+            )
+            queue.mark("run-a")
+            self.assertEqual(self.rebuilt, [])
+            for _ in range(100):
+                if self.rebuilt:
+                    break
+                await asyncio.sleep(0.01)
+
+        asyncio.run(scenario())
         self.assertEqual(self.resolved, [{"run-a"}])
         self.assertEqual(self.rebuilt, [("main", "hp1")])
+
+    def test_without_a_scheduler_or_a_loop_the_mark_is_kept(self):
+        """Marked outside a loop, nothing can drain, so the mark waits for one."""
+        queue = LiveUpdateQueue(resolve=self.resolve, rebuild=self.rebuild)
+        with self.assertLogs(level="ERROR"):
+            queue.mark("run-a")
+
+        queue._schedule = self.schedule
+        queue.mark("run-b")
+        self.run_drain(0)
+        self.assertEqual(self.resolved, [{"run-a", "run-b"}])
 
 
 @pytest.mark.integration
@@ -350,34 +432,32 @@ class TestLiveHparamsPanes(tornado.testing.AsyncHTTPTestCase):
         with open(os.path.join(self._tmp_dir, eid + ".json")) as fn:
             return json.load(fn)
 
-    def test_a_newly_logged_run_joins_a_matching_pane(self):
-        """The pane picks up a run that did not exist when it was built."""
+    def test_a_query_pane_waits_for_an_explicit_refresh(self):
+        """A log write must not trigger the query's whole-store scan."""
         self.create({"query": "lr < 0.01", "win": "hp1"})
         self.assertEqual(self._env_ids("hp1"), ["run-a"])
 
         self.log({"eid": "run-b", "params": {"lr": 0.001}})
         self.settle()
 
-        self.assertEqual(self._env_ids("hp1"), ["run-a", "run-b"])
+        self.assertEqual(self._env_ids("hp1"), ["run-a"])
 
     def test_the_refresh_reaches_disk(self):
         """A live rebuild saves the env, as a requested update does."""
-        self.create({"query": "lr < 0.01", "win": "hp1"})
-        self.log({"eid": "run-b", "params": {"lr": 0.001}})
+        self.create({"env_ids": ["run-a"], "win": "hp1"})
+        self.log({"eid": "run-a", "action": "metrics", "metrics": {"acc": 0.99}})
         self.settle()
 
         records = self._disk_env()["jsons"]["hp1"]["content"]["records"]
-        self.assertEqual(
-            sorted(record["env_id"] for record in records), ["run-a", "run-b"]
-        )
+        self.assertEqual(records[0]["metrics"]["acc"], 0.99)
 
     def test_the_pane_keeps_its_id_and_gets_a_new_contentID(self):
         """The client re-renders on contentID, and the pane keeps its place."""
-        self.create({"query": "lr < 0.01", "win": "hp1"})
+        self.create({"env_ids": ["run-a"], "win": "hp1"})
         before = self._window("hp1")
         content_id, position = before["contentID"], before["i"]
 
-        self.log({"eid": "run-b", "params": {"lr": 0.001}})
+        self.log({"eid": "run-a", "action": "metrics", "metrics": {"acc": 0.99}})
         self.settle()
 
         after = self._window("hp1")
@@ -387,7 +467,7 @@ class TestLiveHparamsPanes(tornado.testing.AsyncHTTPTestCase):
 
     def test_logged_metrics_reach_the_pane(self):
         """The metric values shown are the latest ones logged, not the first."""
-        self.create({"query": "lr < 0.01", "win": "hp1"})
+        self.create({"env_ids": ["run-a"], "win": "hp1"})
         self.log({"eid": "run-a", "action": "metrics", "metrics": {"acc": 0.99}})
         self.settle()
 
@@ -397,7 +477,7 @@ class TestLiveHparamsPanes(tornado.testing.AsyncHTTPTestCase):
 
     def test_finishing_a_run_refreshes_the_pane(self):
         """``finish`` changes the status a pane displays, so it counts as a change."""
-        self.create({"query": "lr < 0.01", "win": "hp1"})
+        self.create({"env_ids": ["run-a"], "win": "hp1"})
         self.log({"eid": "run-a", "action": "finish", "status": "finished"})
         self.settle()
 
@@ -427,10 +507,10 @@ class TestLiveHparamsPanes(tornado.testing.AsyncHTTPTestCase):
         callback instead of arming the loop leaves the queue to say it itself:
         five marks arrange exactly one drain.
         """
-        self.create({"query": "lr < 0.01", "win": "hp1"})
+        self.create({"env_ids": ["run-a"], "win": "hp1"})
         queue = self._app.live_updates
         drains = []
-        queue._schedule = lambda delay, callback: drains.append(callback)
+        queue._schedule = lambda delay, drain: drains.append(drain)
         content_ids = set()
 
         for step in range(5):
@@ -447,33 +527,34 @@ class TestLiveHparamsPanes(tornado.testing.AsyncHTTPTestCase):
         self.assertEqual(len(drains), 1)
         self.assertEqual(len(content_ids), 1)
 
-        drains[0]()
+        self.io_loop.run_sync(drains[0])
         self.assertNotIn(self._window("hp1")["contentID"], content_ids)
 
     def test_a_pane_closed_before_the_drain_is_skipped(self):
         """Closing a pane mid-flight is a race, not a failure."""
-        self.create({"query": "lr < 0.01", "win": "hp1"})
-        self.create({"query": "lr < 0.01", "win": "hp2"})
+        self.create({"env_ids": ["run-a"], "win": "hp1"})
+        self.create({"env_ids": ["run-a"], "win": "hp2"})
 
-        self.log({"eid": "run-b", "params": {"lr": 0.001}})
+        self.log({"eid": "run-a", "action": "metrics", "metrics": {"acc": 0.99}})
         del self._app.state["main"]["jsons"]["hp1"]
         self.settle()
 
-        self.assertEqual(self._env_ids("hp2"), ["run-a", "run-b"])
+        self.assertEqual(self._env_ids("hp2"), ["run-a"])
         self.assertNotIn("hp1", self._app.state["main"]["jsons"])
 
     def test_panes_in_other_envs_are_refreshed_too(self):
         """A pane is refreshed wherever it lives, not only in the logged env."""
-        self.create({"query": "lr < 0.01", "win": "hp1", "eid": "dashboard"})
+        self.create({"env_ids": ["run-a"], "win": "hp1", "eid": "dashboard"})
 
-        self.log({"eid": "run-b", "params": {"lr": 0.001}})
+        self.log({"eid": "run-a", "action": "metrics", "metrics": {"acc": 0.99}})
         self.settle()
 
-        self.assertEqual(self._env_ids("hp1", eid="dashboard"), ["run-a", "run-b"])
+        records = self._window("hp1", eid="dashboard")["content"]["records"]
+        self.assertEqual(records[0]["metrics"]["acc"], 0.99)
 
     def test_readonly_servers_never_mark(self):
         """Logging is refused in readonly mode, so no rebuild can follow it."""
-        self.create({"query": "lr < 0.01", "win": "hp1"})
+        self.create({"env_ids": ["run-a"], "win": "hp1"})
         content_id = self._window("hp1")["contentID"]
 
         self._app.server_state.readonly = True

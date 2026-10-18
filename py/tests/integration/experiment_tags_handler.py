@@ -10,6 +10,8 @@
 
 import asyncio
 import json
+import threading
+from unittest import mock
 
 import pytest
 import tornado.testing
@@ -82,6 +84,122 @@ class TestTagsEndpoint(VisdomHTTPTestCase):
             json.loads(response.body),
             {"run-a": {"owner": "alice"}, "run-b": {"owner": "bob"}},
         )
+
+    def corrupt_env(self, eid, blob):
+        """Make ``eid`` a resident env whose experiment blob will not rebuild.
+
+        Put into live state rather than written to disk, because that is the
+        branch the handler parses itself: ``_experiment_from_env`` reads the
+        blob straight off a materialized env instead of going through the
+        store's guarded read.
+        """
+        self._app.state[eid] = {"jsons": {}, "reload": {}, "experiment": blob}
+
+    def test_a_corrupt_blob_does_not_500_the_tag_map(self):
+        """The tag map walks every resident env, so one bad blob must not empty it."""
+        self.post_json(
+            "/experiments/tags", {"eid": "run-a", "tags": {"owner": "alice"}}
+        )
+        self.corrupt_env("bad", {"env_id": "bad", "status": "cancelled"})
+
+        response = self.post_json("/experiments/tags", {"action": "get"})
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {"run-a": {"owner": "alice"}})
+
+    def test_reading_one_envs_tags_survives_a_corrupt_blob(self):
+        """A single-env read answers "no tags" rather than failing."""
+        self.corrupt_env("bad", {"env_id": "bad", "params": {"lr": 0.1}})
+
+        response = self.fetch("/experiments/tags?eid=bad")
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {})
+
+    def test_tagging_an_env_with_a_corrupt_blob_repairs_it(self):
+        """Tagging is a recovery path, so it must not be the thing that fails."""
+        self.corrupt_env("bad", {"name": "bad", "status": "cancelled"})
+
+        response = self.post_json(
+            "/experiments/tags", {"eid": "bad", "tags": {"owner": "alice"}}
+        )
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {"owner": "alice"})
+        self.assertEqual(self.read_tags("bad"), {"owner": "alice"})
+
+    def test_tagging_an_env_with_a_corrupt_blob_keeps_its_run(self):
+        """Repairing the blob must not be the thing that loses the run.
+
+        The handler passes its live env to the store, so this is the path
+        where a scrambled blob was replaced by an empty experiment: the tag
+        came back, and the params and metrics under it did not.
+        """
+        self.post_json(
+            "/experiments/log",
+            {"eid": "run-c", "name": "sweep-7", "params": {"lr": 0.1}},
+        )
+        blob = dict(self._app.state["run-c"]["experiment"])
+        blob.pop("env_id")
+        self.corrupt_env("run-c", blob)
+
+        response = self.post_json(
+            "/experiments/tags", {"eid": "run-c", "tags": {"owner": "alice"}}
+        )
+
+        self.assertEqual(response.code, 200)
+        experiment = ExperimentStore(JSONStore(self.env_path)).get_experiment("run-c")
+        self.assertEqual(experiment.name, "sweep-7")
+        self.assertEqual(experiment.get_param("lr").value, 0.1)
+        self.assertEqual(tags_to_mapping(experiment.tags), {"owner": "alice"})
+
+    def test_a_corrupt_resident_blob_does_not_serve_the_stored_tags(self):
+        """A materialized env is the version being served, readable or not.
+
+        Its file is whatever the last successful save left behind, so
+        answering from there reports tags the env may no longer have. The
+        resident blob cannot be read, so the honest answer is that it has
+        none.
+        """
+        self.post_json(
+            "/experiments/tags", {"eid": "run-a", "tags": {"owner": "alice"}}
+        )
+        self.assertEqual(self.read_tags("run-a"), {"owner": "alice"})
+        self.corrupt_env("run-a", {"env_id": "run-a", "status": "cancelled"})
+
+        response = self.fetch("/experiments/tags?eid=run-a")
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {})
+
+    def test_the_tag_map_drops_an_env_whose_resident_blob_is_corrupt(self):
+        """The map is built from storage and overlaid with live state.
+
+        An env the overlay cannot read has to be removed from it, not left
+        showing the stored entry it was meant to replace.
+        """
+        self.post_json(
+            "/experiments/tags", {"eid": "run-a", "tags": {"owner": "alice"}}
+        )
+        self.post_json("/experiments/tags", {"eid": "run-b", "tags": {"owner": "bob"}})
+        self.corrupt_env("run-a", {"env_id": "run-a", "status": "cancelled"})
+
+        response = self.post_json("/experiments/tags", {"action": "get"})
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {"run-b": {"owner": "bob"}})
+
+    def test_an_env_with_no_metadata_is_still_answered_from_storage(self):
+        """Only an unreadable blob shadows the file; an absent one does not."""
+        self.post_json(
+            "/experiments/tags", {"eid": "run-a", "tags": {"owner": "alice"}}
+        )
+        self._app.state["run-a"] = {"jsons": {}, "reload": {}}
+
+        response = self.fetch("/experiments/tags?eid=run-a")
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {"owner": "alice"})
 
     def test_set_broadcasts_one_transport_neutral_message(self):
         websocket = FakeSocket("websocket")
@@ -247,3 +365,87 @@ class TestConcurrentMetadataWrites(VisdomHTTPTestCase):
         stored = JSONStore(self.env_path).load_env("main")
         self.assertIn(win, stored["jsons"])
         self.assertEqual(stored["experiment"]["metrics"][0]["key"], "acc")
+
+
+class ThreadRecordingStore(JSONStore):
+    """JSONStore that remembers which thread each metadata read ran on."""
+
+    def __init__(self, env_path):
+        super().__init__(env_path)
+        self.read_threads = []
+
+    def list_envs(self):
+        self.read_threads.append(threading.current_thread().name)
+        return super().list_envs()
+
+    def load_experiment(self, eid):
+        self.read_threads.append(threading.current_thread().name)
+        return super().load_experiment(eid)
+
+
+class TestTagReadsStayOffTheLoop(VisdomHTTPTestCase):
+    """Answering a tag read must not park the loop on a file read.
+
+    Tags are a few hundred bytes, but they are stored inside the environment
+    that carries them, so reading one off disk means opening and parsing an
+    environment file -- megabytes of window data for a busy env, and every
+    environment the store knows when no ``eid`` is named. Done on the loop, that
+    is the whole server stopped: no other request is served, no socket is
+    written, for as long as the read takes.
+    """
+
+    COLD = "cold"
+
+    def get_app(self):
+        # Seeded before the app is built so the tags exist only on disk: the
+        # server knows the env by its file and has never materialised it, which
+        # is the case that has to reach the store at all.
+        ExperimentStore(JSONStore(self.env_path)).update_tags(
+            self.COLD, {"owner": "alice"}
+        )
+        # The recorder has to be the store the app builds for itself:
+        # ``ServerState`` takes its own reference at construction, so one
+        # swapped onto the app afterwards would be read by nobody.
+        with mock.patch("visdom.server.app.JSONStore", ThreadRecordingStore):
+            app = super().get_app()
+        self.recorder = app.storage
+        return app
+
+    def setUp(self):
+        super().setUp()
+        # Booting reads the env directory to build the lazy state; only what a
+        # request goes on to do counts here.
+        self.recorder.read_threads.clear()
+
+    def assertReadOffLoop(self):
+        """The read reached the store, and not on the thread serving requests."""
+        self.assertTrue(self.recorder.read_threads, "the read never reached the store")
+        for name in self.recorder.read_threads:
+            self.assertNotEqual(name, threading.current_thread().name)
+            self.assertTrue(name.startswith("visdom-storage"), name)
+
+    def test_one_envs_tags_are_read_on_the_storage_worker(self):
+        response = self.fetch("/experiments/tags?eid={0}".format(self.COLD))
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {"owner": "alice"})
+        self.assertReadOffLoop()
+
+    def test_every_envs_tags_are_read_on_the_storage_worker(self):
+        """The unfiltered read walks the whole store, so it especially must."""
+        response = self.post_json("/experiments/tags", {"action": "get"})
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {self.COLD: {"owner": "alice"}})
+        self.assertReadOffLoop()
+
+    def test_a_resident_env_answers_without_reaching_the_store(self):
+        """An env already in memory is served from it, off no thread at all."""
+        self.post_json("/experiments/tags", {"eid": "warm", "tags": {"stage": "dev"}})
+        self.recorder.read_threads.clear()
+
+        response = self.fetch("/experiments/tags?eid=warm")
+
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json.loads(response.body), {"stage": "dev"})
+        self.assertEqual(self.recorder.read_threads, [])

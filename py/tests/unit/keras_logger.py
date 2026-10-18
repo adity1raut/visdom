@@ -15,10 +15,14 @@ loop needed.
 """
 
 import unittest
+from importlib.util import find_spec
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
+if not any(find_spec(name) for name in ("tensorflow", "keras")):
+    pytest.skip("tensorflow or keras is not installed", allow_module_level=True)
 
 from visdom.loggers.keras import VisdomKerasLogger
 
@@ -90,6 +94,21 @@ class TestOnEpochEnd(unittest.TestCase):
         self.logger.viz.line.side_effect = RuntimeError("boom")
         with self.assertWarns(UserWarning):
             self.logger.on_epoch_end(0, logs={"loss": 0.9})
+
+    def test_failed_window_creation_is_not_tracked(self):
+        """A send that fails returns False instead of raising."""
+        self.logger.viz.line.side_effect = lambda *a, **kw: False
+        self.logger.on_epoch_end(0, logs={"loss": 0.9})
+        self.assertNotIn("loss", self.logger._wins)
+
+    def test_window_is_created_again_once_the_server_recovers(self):
+        self.logger.viz.line.side_effect = lambda *a, **kw: False
+        self.logger.on_epoch_end(0, logs={"loss": 0.9})
+        self.logger.viz.line.side_effect = lambda *a, **kw: Mock()
+        self.logger.on_epoch_end(1, logs={"loss": 0.8})
+        kwargs = self.logger.viz.line.call_args.kwargs
+        self.assertNotIn("win", kwargs)
+        self.assertIn("loss", self.logger._wins)
 
 
 class TestOnTrainBegin(unittest.TestCase):
@@ -206,6 +225,22 @@ class TestOnTrainBatchEnd(unittest.TestCase):
         with self.assertWarns(UserWarning):
             logger.on_train_batch_end(0, logs={"loss": 0.9})
         self.assertEqual(logger._step, 1)
+
+    def test_failed_step_window_creation_is_not_tracked(self):
+        logger = _logger(log_every=1)
+        logger.viz.line.side_effect = lambda *a, **kw: False
+        logger.on_train_batch_end(0, logs={"loss": 0.9})
+        self.assertNotIn("loss", logger._step_wins)
+
+    def test_step_window_is_created_again_once_the_server_recovers(self):
+        logger = _logger(log_every=1)
+        logger.viz.line.side_effect = lambda *a, **kw: False
+        logger.on_train_batch_end(0, logs={"loss": 0.9})
+        logger.viz.line.side_effect = lambda *a, **kw: Mock()
+        logger.on_train_batch_end(1, logs={"loss": 0.8})
+        kwargs = logger.viz.line.call_args.kwargs
+        self.assertNotIn("win", kwargs)
+        self.assertIn("loss", logger._step_wins)
 
 
 if __name__ == "__main__":

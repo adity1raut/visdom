@@ -7,11 +7,15 @@
  *
  */
 
+import './EnvModal.css';
+
 import React, { useContext, useEffect, useState } from 'react';
 import ReactModal from 'react-modal';
 
 import ApiContext from '../api/ApiContext';
 import { MODAL_STYLE } from '../settings';
+import { showToast } from '../toasts/toastEvents';
+import EnvSelectDropdown from './EnvSelectDropdown';
 
 const MAX_TAG_NAME_LENGTH = 50;
 const MAX_TAGS_PER_ENV = 20;
@@ -64,8 +68,11 @@ function EnvModal(props) {
     setTagEnv(activeEnv || envList[0] || '');
     setTagSaveStatus('idle');
     setTagSaveError('');
-    setSelectedEnvs([]);
   }, [activeEnv, show]);
+
+  useEffect(() => {
+    setSelectedEnvs([]);
+  }, [show]);
 
   useEffect(() => {
     setTagRows(rowsFromTags(tags[tagEnv]));
@@ -131,11 +138,7 @@ function EnvModal(props) {
   // rendering
   // ---------
 
-  const selectableEnvs = envList.filter((env) => env !== 'main');
   const selectedEnvsSet = new Set(selectedEnvs);
-  const isAllSelected =
-    selectableEnvs.length > 0 &&
-    selectableEnvs.every((env) => selectedEnvsSet.has(env));
   return (
     <ReactModal
       isOpen={show}
@@ -167,96 +170,80 @@ function EnvModal(props) {
         </button>
       </div>
       <br />
-      Select environments to delete:
-      <br />
-      <div className="form-inline">
-        <div
-          style={{
-            border: '1px solid #ccc',
-            padding: '10px',
-            height: '140px',
-            overflowY: 'scroll',
-            marginBottom: '10px',
-            width: '100%',
-            borderRadius: '4px',
-            backgroundColor: '#fff',
-          }}
-        >
-          <label
-            style={{ display: 'block', fontWeight: 'bold', cursor: 'pointer' }}
-          >
-            <input
-              type="checkbox"
-              style={{ marginRight: '8px' }}
-              disabled={!canWrite || selectableEnvs.length === 0}
-              checked={isAllSelected}
-              onChange={(ev) => {
-                setSelectedEnvs(ev.target.checked ? selectableEnvs : []);
-              }}
-            />
-            Select All
-          </label>
-          <hr style={{ margin: '5px 0' }} />
-
-          {envList.map((env) => (
-            <label
-              key={env}
-              style={{
-                display: 'block',
-                fontWeight: 'normal',
-                cursor: env === 'main' ? 'not-allowed' : 'pointer',
-                color: env === 'main' ? '#999' : '#333',
-                wordBreak: 'break-all',
-              }}
-            >
-              <input
-                type="checkbox"
-                style={{ marginRight: '8px' }}
-                value={env}
-                disabled={!canWrite || env === 'main'}
-                checked={selectedEnvsSet.has(env)}
-                onChange={(ev) => {
-                  if (ev.target.checked) {
-                    setSelectedEnvs((prev) =>
-                      Array.from(new Set([...prev, env]))
-                    );
-                  } else {
-                    setSelectedEnvs((prev) => prev.filter((e) => e !== env));
-                  }
-                }}
-              />
-              {env}{' '}
-              {env === 'main' && (
-                <span style={{ fontSize: '0.8em' }}>(protected)</span>
-              )}
-            </label>
-          ))}
-        </div>
-
+      <div className="env-delete-heading">
+        <span>Select environments to delete:</span>
+        <span className="env-delete-hint">
+          {selectedEnvs.length === 0
+            ? 'Pick one or more environments below.'
+            : `${selectedEnvs.length} environment${
+                selectedEnvs.length === 1 ? '' : 's'
+              } will be removed permanently.`}
+        </span>
+      </div>
+      <EnvSelectDropdown
+        activeEnv={activeEnv}
+        disabled={!canWrite}
+        envList={envList}
+        onChange={setSelectedEnvs}
+        resetToken={show}
+        selectedEnvs={selectedEnvs}
+      />
+      <div className="env-delete-row">
         <button
-          className="btn btn-default"
+          className="btn btn-danger"
           disabled={
             !canWrite ||
             selectedEnvs.length === 0 ||
             selectedEnvsSet.has('main')
           }
           onClick={() => {
+            const deletedEnvs = [...selectedEnvs];
             // push active env at last to prevent breaking the queue
-            let sortedEnvs = selectedEnvs.filter((env) => env !== activeEnv);
+            let sortedEnvs = deletedEnvs.filter((env) => env !== activeEnv);
             if (selectedEnvsSet.has(activeEnv)) {
               sortedEnvs.push(activeEnv);
             }
-            sortedEnvs.forEach((env) => {
-              onEnvDelete(env, activeEnv);
-            });
-            setSelectedEnvs([]);
-            onModalClose();
+            const requestedDeletions = onEnvDelete(sortedEnvs, activeEnv);
+            if (requestedDeletions.length === 0) {
+              showToast(
+                'Unable to delete environments because the server connection is unavailable.',
+                'error'
+              );
+              return;
+            }
+            const requestedDeletionSet = new Set(requestedDeletions);
+            const failedDeletions = deletedEnvs.filter(
+              (env) => !requestedDeletionSet.has(env)
+            );
+            if (
+              requestedDeletionSet.has(tagEnv) &&
+              !requestedDeletionSet.has(activeEnv)
+            ) {
+              setTagEnv(activeEnv || 'main');
+              setTagSaveStatus('idle');
+              setTagSaveError('');
+            }
+            setSelectedEnvs(failedDeletions);
+            if (failedDeletions.length > 0) {
+              showToast(
+                'Some environment deletion requests could not be sent.',
+                'error'
+              );
+              return;
+            }
+            showToast(
+              deletedEnvs.length === 1
+                ? `Successfully deleted environment "${deletedEnvs[0]}".`
+                : `Successfully deleted ${deletedEnvs.length} environments.`,
+              'success'
+            );
           }}
+          type="button"
         >
           Delete Selected
         </button>
       </div>
-      <hr />
+      <hr className="env-modal-divider" />
       <span className="visdom-title">Manage Tags</span>
       <br />
       Add optional key/value tags to an environment:

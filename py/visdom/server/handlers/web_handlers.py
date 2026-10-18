@@ -35,6 +35,7 @@ from visdom.utils.shared_utils import (
 from visdom.utils.server_utils import (
     check_auth,
     check_readonly,
+    create_args_for_append,
     delete_env_off_loop,
     ensure_env_loaded,
     ensure_env_present,
@@ -48,7 +49,6 @@ from visdom.utils.server_utils import (
     warm_env,
     window,
     register_window,
-    gather_envs,
     broadcast_envs,
     broadcast_tags,
     escape_eid,
@@ -58,18 +58,19 @@ from visdom.utils.server_utils import (
     update_window,
     hash_password_off_loop,
     stringify,
-    push_deleted,
-    clear_deleted,
+    push_deleted_many_off_loop,
+    forget_closed_panes,
     notify,
     LazyEnvData,
 )
 from visdom.server.handlers.base_handlers import BaseHandler
 from visdom.experiments import (
     DEFAULT_SORT_FIELD,
-    Experiment,
     ExperimentStore,
     ExperimentFinishedError,
+    METADATA_KEY,
     QueryParseError,
+    experiment_from_blob,
     retarget_experiment,
     STATUS_FINISHED,
     tags_to_mapping,
@@ -125,6 +126,30 @@ class ExistsHandler(BaseHandler):
 
 class UpdateHandler(BaseHandler):
     @staticmethod
+    def bump_version(p):
+        """Advance the pane's broadcast sequence number and return the new value.
+
+        The frontend applies an incremental patch only when the message carries
+        exactly ``pane.version + 1`` (``updateWindow`` in ``js/main.js``); any
+        other value makes it discard the patch and re-request the whole
+        environment. Every path that broadcasts a ``window_update`` therefore has
+        to move this counter.
+
+        It lives here rather than in ``update_window()`` because
+        ``UpdateHandler.update()`` returns before that helper for text,
+        image_history, plot_history and table panes, and the embeddings route
+        never calls it at all. Those types stayed pinned at version 1 while the
+        server kept broadcasting updates, so the client's check could never pass
+        and every update cost a full environment reload.
+
+        Reads through ``get`` rather than ``+= 1`` so that an environment
+        persisted before panes carried a version still updates instead of raising
+        ``KeyError`` out of a request.
+        """
+        p["version"] = p.get("version", 1) + 1
+        return p["version"]
+
+    @staticmethod
     def update_packet(
         p, args, max_text_lines, max_old_content, max_image_history, max_plot_history
     ):
@@ -145,6 +170,21 @@ class UpdateHandler(BaseHandler):
             max_image_history,
             max_plot_history,
         )
+        # ``update()`` hands the pane straight back when it turns an update
+        # down: a ``/update`` aimed at a table, an image slider move on a pane
+        # holding no frames, a heatmap append whose shape does not line up with
+        # the plot it is aimed at. ``old_p`` deep-copied everything ``update()``
+        # mutates in place, so an unchanged pane here means nothing was applied.
+        # A rejected update has no revision to announce: bumping for one spends
+        # a version on a patch that carries no change and rerolls ``contentID``
+        # to make the frontend redraw the pane it already has. Leave both alone
+        # and hand back an empty patch, which ``wrap_func`` declines to send.
+        if p == old_p:
+            return p, []
+
+        # Bumped before the patch is computed so the diff carries the new
+        # version to the client, keeping its copy in step for the next update.
+        UpdateHandler.bump_version(p)
         p["contentID"] = get_rand_id()
 
         patch = jsonpatch.make_patch(old_p, p)
@@ -152,21 +192,28 @@ class UpdateHandler(BaseHandler):
 
     @staticmethod
     def update_embeddings_packet(p, args, max_old_content):
-        update_type = args["data"]["update_type"]
+        data = args.get("data")
+        if not isinstance(data, dict):
+            raise tornado.web.HTTPError(
+                400, reason="embeddings update data must be an object"
+            )
+        update_type = data["update_type"]
         content_id = get_rand_id()
         if update_type == "EntitySelected":
-            selected = args["data"]["selected"]
+            selected = data["selected"]
             p["content"]["selected"] = selected
             p["contentID"] = content_id
+            version = UpdateHandler.bump_version(p)
             # `selected` may not exist yet on the first selection, so use "add"
             # (which also overwrites when the key is already present).
             return [
                 {"op": "add", "path": "/content/selected", "value": selected},
                 {"op": "replace", "path": "/contentID", "value": content_id},
+                {"op": "replace", "path": "/version", "value": version},
             ]
         if update_type == "RegionSelected":
             old_data = p["content"]["data"]
-            new_data = args["data"]["points"]
+            new_data = data["points"]
             p["old_content"].append(old_data)
             # Cap retained history to prevent unbounded in-memory growth (#1320).
             if len(p["old_content"]) > max_old_content:
@@ -175,18 +222,42 @@ class UpdateHandler(BaseHandler):
             p["content"]["has_previous"] = True
             p["content"]["selected"] = None
             p["contentID"] = content_id
+            version = UpdateHandler.bump_version(p)
             return [
                 {"op": "replace", "path": "/content/data", "value": new_data},
                 {"op": "add", "path": "/content/has_previous", "value": True},
                 {"op": "add", "path": "/content/selected", "value": None},
                 {"op": "replace", "path": "/contentID", "value": content_id},
+                {"op": "replace", "path": "/version", "value": version},
             ]
+        # An unrecognised update_type changed nothing, so there is no version to
+        # announce and no patch to send.
         return []
 
     @staticmethod
     def update(
         p, args, max_text_lines, max_old_content, max_image_history, max_plot_history
     ):
+        if not args.get("data") and not args.get("delete") and args.get("name") is None:
+            # opts/layout-only update (e.g. update_window_opts): works for
+            # any pane type. A delete/named update also carries no data but
+            # is a content change, so it must reach the branches below.
+            return update_window(p, args)
+        # A delete/named update with no data, or an empty data list -- the
+        # opts-only case already returned above. These types have no
+        # delete/name semantics and would otherwise crash indexing
+        # args["data"], or (embeddings) silently empty every point instead
+        # of being rejected.
+        if not args.get("data") and p["type"] in (
+            "text",
+            "image_history",
+            "plot_history",
+            "embeddings",
+        ):
+            raise tornado.web.HTTPError(
+                400,
+                reason="{} panes do not support delete/name updates".format(p["type"]),
+            )
         # Update text in window, separated by a line break
         if p["type"] == "text":
             p["content"] += "<br>" + args["data"][0]["content"]
@@ -396,7 +467,13 @@ class UpdateHandler(BaseHandler):
         return p
 
     @staticmethod
-    def broadcast_window_update(handler, args, eid, p, diff_packet):
+    def window_update_message(args, eid, p, diff_packet):
+        """Encode the patch broadcast for ``p``, ready to put on the wire.
+
+        Split out from ``broadcast_window_update`` so a caller that has to know
+        how large the patch is can measure the string it is about to send
+        instead of serialising the pane a second time to estimate it.
+        """
         broadcast_packet = {
             "command": "window_update",
             "win": args["win"],
@@ -404,7 +481,46 @@ class UpdateHandler(BaseHandler):
             "content": diff_packet,
             "version": p.get("version", 1),
         }
-        broadcast(handler, json.dumps(broadcast_packet, cls=NanSafeEncoder), eid)
+        return json.dumps(broadcast_packet, cls=NanSafeEncoder)
+
+    @staticmethod
+    def broadcast_window_update(handler, args, eid, p, diff_packet):
+        broadcast(
+            handler,
+            UpdateHandler.window_update_message(args, eid, p, diff_packet),
+            eid,
+        )
+
+    @staticmethod
+    def pane_min_bytes(p):
+        """A lower bound on the encoded size of ``p``, without encoding it.
+
+        In a ``json.dumps`` array every element costs at least one character
+        and every element after the first also carries the two-character ``,``
+        separator, so a trace array of ``k`` values cannot encode to fewer than
+        ``3k - 2`` characters. That bounds the pane from below in O(traces)
+        where encoding it is O(points). Every element type clears the one-char
+        floor (``null`` is four, ``""`` and ``[]`` are two), and the pane's
+        keys, layout and envelope are ignored, so the bound only ever
+        understates -- which costs an exact comparison that could have been
+        skipped, never a wrong answer.
+
+        A pane with no trace arrays to count -- text, HTML, an image, anything
+        whose ``content`` is not a dict of traces -- bounds to zero, which is
+        the same understatement and simply leaves the comparison exact.
+        """
+        content = p.get("content")
+        traces = content.get("data") if isinstance(content, dict) else None
+        if not isinstance(traces, (list, tuple)):
+            return 0
+        total = 0
+        for trace in traces:
+            if not isinstance(trace, dict):
+                continue
+            for value in trace.values():
+                if isinstance(value, (list, tuple)) and value:
+                    total += 3 * len(value) - 2
+        return total
 
     @staticmethod
     def wrap_func(handler, args):
@@ -416,6 +532,8 @@ class UpdateHandler(BaseHandler):
             raise tornado.web.HTTPError(
                 400, reason="request must include one of: data, layout, or opts"
             )
+        if not isinstance(args.get("layout_create", {}), dict):
+            raise tornado.web.HTTPError(400, reason="layout_create must be an object")
         eid = extract_eid(args)
 
         if eid not in handler.state:
@@ -426,7 +544,7 @@ class UpdateHandler(BaseHandler):
             # that window
             append = args.get("append")
             if append:
-                p = window(args)
+                p = window(create_args_for_append(args))
                 register_window(handler, p, eid)
             else:
                 handler.write("win does not exist")
@@ -444,34 +562,51 @@ class UpdateHandler(BaseHandler):
             handler.write("win is not image_history; was {}".format(p["type"]))
             return
 
-        if not (
+        is_content_update = (
+            args.get("data") or args.get("delete") or args.get("name") is not None
+        )
+        content_data = (
+            p["content"].get("data") if isinstance(p["content"], dict) else None
+        )
+        if is_content_update and not (
             p["type"] == "text"
             or p["type"] == "image_history"
             or p["type"] == "plot_history"
             or p["type"] == "embeddings"
             or p["type"] == "table"
             or (
-                len(p["content"]["data"]) == 0
-                or p["content"]["data"][0]["type"]
-                in ["scatter", "scatter3d", "scattergl", "custom", "heatmap"]
+                isinstance(content_data, list)
+                and (
+                    len(content_data) == 0
+                    or content_data[0]["type"]
+                    in ["scatter", "scatter3d", "scattergl", "custom", "heatmap"]
+                )
             )
         ):
+            handler.set_status(400)
             handler.write(
                 "win is not scatter, heatmap, custom, image_history, plot_history, embeddings, or text; "
                 "was {}".format(
-                    p["content"]["data"][0]["type"]
-                    if len(p["content"]["data"]) > 0
+                    content_data[0]["type"]
+                    if isinstance(content_data, list) and len(content_data) > 0
                     else "empty"
                 )
             )
             return
 
-        if p["type"] == "embeddings":
+        if p["type"] == "embeddings" and args.get("data"):
             diff_packet = UpdateHandler.update_embeddings_packet(
                 p, args, handler.max_old_content
             )
-            UpdateHandler.broadcast_window_update(handler, args, eid, p, diff_packet)
-            handler.mark_dirty(eid)
+            # An empty patch means the update_type was not recognised and the
+            # pane is unchanged. Broadcasting it anyway would send a version the
+            # client cannot reconcile, costing it a full environment reload for a
+            # no-op.
+            if diff_packet:
+                UpdateHandler.broadcast_window_update(
+                    handler, args, eid, p, diff_packet
+                )
+                handler.mark_dirty(eid)
             handler.write(p["id"])
             return
 
@@ -490,14 +625,28 @@ class UpdateHandler(BaseHandler):
                 handler.write(str(exc))
                 return
             raise
-        # send the smaller of the patch and the updated pane
-        if len(stringify(p)) <= len(stringify(diff_packet)):
-            broadcast_msg = dict(p)
-            broadcast_msg["eid"] = eid
-            broadcast(handler, json.dumps(broadcast_msg, cls=NanSafeEncoder), eid)
-        else:
-            UpdateHandler.broadcast_window_update(handler, args, eid, p, diff_packet)
-        handler.mark_dirty(eid)
+        # An empty patch means ``update_packet`` refused the update and left the
+        # pane on the version the browser already holds. A ``window_update``
+        # repeating that version fails the frontend's "exactly one ahead" check
+        # and sends it back for the whole environment, so say nothing at all --
+        # there is no change to save either. The pane id below is still the
+        # ack, as it is for an update that did land.
+        if diff_packet:
+            # Send the smaller of the patch and the updated pane. The pane is
+            # only encoded when it could actually win: pane_min_bytes bounds its
+            # encoded size from below, so a patch already shorter than that
+            # bound cannot be beaten and the encode -- the one whose cost grows
+            # with the data already plotted -- is skipped. Every other update
+            # compares for real.
+            msg = UpdateHandler.window_update_message(args, eid, p, diff_packet)
+            if UpdateHandler.pane_min_bytes(p) < len(msg):
+                broadcast_msg = dict(p)
+                broadcast_msg["eid"] = eid
+                pane_msg = json.dumps(broadcast_msg, cls=NanSafeEncoder)
+                if len(pane_msg) <= len(msg):
+                    msg = pane_msg
+            broadcast(handler, msg, eid)
+            handler.mark_dirty(eid)
         handler.write(p["id"])
 
     @check_auth
@@ -515,17 +664,97 @@ class UpdateHandler(BaseHandler):
 
 class CloseHandler(BaseHandler):
     @staticmethod
-    def wrap_func(handler, args):
+    async def wrap_func(handler, args):
+        """Close one pane, or every pane in an env, recording the undo off the loop.
+
+        The panes leave ``state`` here, on the loop, before anything is
+        awaited, so a close is still all-or-nothing as far as any other request
+        can tell -- and a pane that was already gone is still announced, as it
+        always was. Their undo entries then go to the storage worker as one
+        write rather than one per pane: closing an env with many panes used to
+        read and rewrite its undo file once per pane, inline.
+
+        If that write fails the panes go back where they came from: the only
+        copy of a closed pane between the pop and the write is the one this
+        call is holding, so a close that cannot be recorded has to be a close
+        that did not happen rather than one nothing can undo. A close that did
+        not happen also leaves no undo entry, so whatever the write may still
+        manage to record for the panes that came back is taken out again.
+
+        What is announced is decided after that write, against the env as it
+        stands then: the loop kept serving while the undo stack was written, so
+        a pane id this close popped may have been written again in the
+        meantime. Announcing its close would take that new pane off every
+        client while the server still holds it.
+        """
         eid = extract_eid(args)
+        if eid not in handler.state:
+            return
         win = args.get("win")
 
-        keys = list(handler.state[eid]["jsons"].keys()) if win is None else [win]
-        for win in keys:
-            p_data = handler.state[eid]["jsons"].pop(win, None)
+        env = handler.state[eid]
+        keys = list(env["jsons"].keys()) if win is None else [win]
+        closed = []
+        for key in keys:
+            p_data = env["jsons"].pop(key, None)
+            closed.append((key, p_data))
             if p_data is not None:
-                push_deleted(handler.storage, eid, win, p_data)
                 handler.mark_dirty(eid)
-            broadcast(handler, json.dumps({"command": "close", "data": win}), eid)
+
+        panes = [(key, p_data) for key, p_data in closed if p_data is not None]
+        if panes:
+            try:
+                await push_deleted_many_off_loop(handler, eid, panes)
+            except BaseException:
+                # ``BaseException`` because a cancelled request loses the panes
+                # exactly as a failed write does: the await is where the close
+                # is interrupted either way, and the handler is the only thing
+                # holding them. Nothing is swallowed -- every one is re-raised.
+                #
+                # The panes are already out of ``state``: the only copy of
+                # them left is the one in this frame. Dropping it loses them
+                # for good -- the close is not announced, so clients keep
+                # showing panes the server no longer has, and the next autosave
+                # writes the env without them. They go back instead, and the
+                # env is marked so that save records the env as it still is.
+                #
+                # Only ids that are still missing are restored. A pane written
+                # back under one of them while this write was out is newer than
+                # what the close popped, and overwriting it here would undo a
+                # live window. If the env itself is gone, there is nothing to
+                # restore it into.
+                restored = []
+                if handler.state.get(eid) is env:
+                    for key, p_data in panes:
+                        if env["jsons"].setdefault(key, p_data) is p_data:
+                            restored.append((key, p_data))
+                    handler.mark_dirty(eid)
+                if restored:
+                    # Cancelling the future above does not stop the worker: the
+                    # push can still be queued, or running, and land after this
+                    # -- leaving the pane back in the env and recorded as
+                    # closed both, for an undo to restore over whatever holds
+                    # its id by then. The entries go back out behind the write
+                    # that may yet make them, which the single worker orders
+                    # for us. Only for the panes that actually came back: an id
+                    # taken by a newer window keeps the close that took it,
+                    # because the undo stack is then the one place the pane it
+                    # closed still exists.
+                    forget_closed_panes(handler, eid, restored)
+                raise
+            if handler.state.get(eid) is not env:
+                # A delete_env landed while the undo stack was being written:
+                # the env these panes belonged to is gone, along with the file
+                # just written, so there is nothing left to announce.
+                return
+
+        for key, _p_data in closed:
+            if key in env["jsons"]:
+                # A pane was written back under this id while the undo stack
+                # was: the window there now is a new one, not the one this
+                # close popped, and it is not this close's to announce.
+                continue
+            broadcast(handler, json.dumps({"command": "close", "data": key}), eid)
 
     @check_auth
     @check_readonly
@@ -534,7 +763,7 @@ class CloseHandler(BaseHandler):
             tornado.escape.to_basestring(self.request.body)
         )
         await ensure_env_loaded(self, extract_eid(args))
-        self.wrap_func(self, args)
+        await self.wrap_func(self, args)
 
 
 class DeleteEnvHandler(BaseHandler):
@@ -542,10 +771,11 @@ class DeleteEnvHandler(BaseHandler):
     def wrap_func(handler, args):
         """Drop an env, answering with the future for its removal from disk.
 
-        The env leaves memory and the subscribers hear about it here; only the
-        file removal is handed to the storage worker, so callers that need the
-        disk to be settled -- the request handler below, and tests -- await
-        what comes back. ``None`` means there was nothing to delete.
+        The env leaves memory and the subscribers hear about it here; the files
+        it owns -- its undo stack as well as the env itself -- are handed to
+        the storage worker, so callers that need the disk to be settled -- the
+        request handler below, and tests -- await what comes back. ``None``
+        means there was nothing to delete.
         """
         eid = args.get("eid")
         if eid is None:
@@ -554,7 +784,6 @@ class DeleteEnvHandler(BaseHandler):
         if eid == "main":
             return None
         handler.state.pop(eid, None)
-        clear_deleted(handler.storage, eid)
         removal = delete_env_off_loop(handler, eid)
         broadcast_envs(handler)
         return removal
@@ -599,8 +828,20 @@ class EnvStateHandler(BaseHandler):
 class ForkEnvHandler(BaseHandler):
     @staticmethod
     async def wrap_func(handler, args):
-        prev_eid = escape_eid(args.get("prev_eid"))
-        eid = escape_eid(args.get("eid"))
+        if not isinstance(args, Mapping):
+            raise tornado.web.HTTPError(400, reason="request body must be an object")
+        prev_eid = args.get("prev_eid")
+        eid = args.get("eid")
+        if not isinstance(prev_eid, str) or not isinstance(eid, str):
+            raise tornado.web.HTTPError(
+                400, reason="both 'prev_eid' and 'eid' must be strings"
+            )
+        prev_eid = escape_eid(prev_eid)
+        eid = escape_eid(eid)
+        if not eid:
+            raise tornado.web.HTTPError(400, reason="'eid' must not be empty")
+        if not prev_eid:
+            raise tornado.web.HTTPError(400, reason="'prev_eid' must not be empty")
 
         if prev_eid not in handler.state:
             # the eid stays out of the reason: it is echoed on the status line,
@@ -613,10 +854,15 @@ class ForkEnvHandler(BaseHandler):
         # env it was forked from held. The copy also carries the source env's
         # experiment metadata, whose env_id still names the env it was forked
         # from; retarget it so the fork does not answer to its parent's id.
+        source = handler.state[prev_eid]
         await ensure_env_loaded(handler, prev_eid)
-        handler.state[eid] = retarget_experiment(
-            snapshot_env(handler.state[prev_eid]), eid
-        )
+        if handler.state.get(prev_eid) is not source:
+            # the source was deleted while it was being read off the worker,
+            # so answer as though it had never been there -- indexing it here
+            # would raise, and forking whatever replaced it is not what was
+            # asked for.
+            raise tornado.web.HTTPError(400, reason="env to be forked doesn't exist")
+        handler.state[eid] = retarget_experiment(snapshot_env(source), eid)
         await save_env_off_loop(handler, eid)
         broadcast_envs(handler)
 
@@ -625,9 +871,14 @@ class ForkEnvHandler(BaseHandler):
     @check_auth
     @check_readonly
     async def post(self):
-        args = tornado.escape.json_decode(
-            tornado.escape.to_basestring(self.request.body)
-        )
+        try:
+            args = tornado.escape.json_decode(
+                tornado.escape.to_basestring(self.request.body)
+            )
+        except (ValueError, TypeError):
+            raise tornado.web.HTTPError(
+                400, reason="request body must be valid JSON"
+            ) from None
         await self.wrap_func(self, args)
 
 
@@ -658,6 +909,7 @@ class EnvHandler(BaseHandler):
                         self.subs[sid],
                         self.storage,
                         undo_count,
+                        warmed=True,
                     )
                 except ValueError:
                     notify(
@@ -677,7 +929,8 @@ class EnvHandler(BaseHandler):
 class CompareHandler(BaseHandler):
     @check_auth
     def get(self, eids):
-        for eid in eids.split("+"):
+        for raw_eid in eids.split("+"):
+            eid = escape_eid(raw_eid)
             if eid not in self.state:
                 raise tornado.web.HTTPError(
                     404, reason=f"Environment '{eid}' not found"
@@ -689,13 +942,35 @@ class CompareHandler(BaseHandler):
 
     @check_auth
     async def post(self, args):
-        body = tornado.escape.json_decode(
-            tornado.escape.to_basestring(self.request.body)
-        )
+        """Send environment comparison data to a subscriber socket.
+
+        Expects a JSON object with a ``sid`` string identifying the target
+        subscriber session, or null representing an uninitialized client
+        session that is handled as a no-op. Returns HTTP 400 if the request
+        body is not valid JSON, is not an object, or contains an invalid
+        ``sid`` type. When ``sid`` is unknown, the request safely returns
+        HTTP 200 without dispatching comparison data.
+        """
+        try:
+            body = tornado.escape.json_decode(
+                tornado.escape.to_basestring(self.request.body)
+            )
+        except ValueError:
+            raise tornado.web.HTTPError(400, reason="request body must be valid JSON")
+
+        if not isinstance(body, Mapping):
+            raise tornado.web.HTTPError(400, reason="request body must be an object")
+
+        if "sid" not in body:
+            raise tornado.web.HTTPError(400, reason="missing required field: 'sid'")
+
         sid = body["sid"]
+        if sid is not None and (not isinstance(sid, str) or not sid.strip()):
+            raise tornado.web.HTTPError(400, reason="invalid required field: 'sid'")
+
         show_all = body.get("show_all", False)
-        if sid in self.subs:
-            eids = args.split("+")
+        if sid and sid in self.subs:
+            eids = [escape_eid(eid) for eid in args.split("+")]
             try:
                 # comparison reads every named env in full, and reads it from
                 # state -- so each one is brought into memory here, where the
@@ -708,6 +983,7 @@ class CompareHandler(BaseHandler):
                     self.subs[sid],
                     self.storage,
                     show_all=show_all,
+                    warmed=True,
                 )
             except ValueError:
                 notify(
@@ -719,22 +995,53 @@ class CompareHandler(BaseHandler):
                 return
 
 
+def _decode_json_body(body):
+    """Return a request body decoded into a dict of arguments.
+
+    Shared by handlers whose bodies are JSON objects, so an empty body is read
+    as an empty object and each handler decides on its own whether the arguments
+    it needs are missing. Anything else that is not a JSON object is the caller's
+    error: without this check, malformed JSON or a bare list would surface as an
+    unhandled exception and a 500 rather than a 400 naming what was wrong with
+    the request.
+    """
+    try:
+        text = tornado.escape.to_basestring(body).strip()
+        if not text:
+            return {}
+        args = tornado.escape.json_decode(text)
+    except ValueError as error:
+        raise tornado.web.HTTPError(
+            400, reason="request body must be valid JSON"
+        ) from error
+    if not isinstance(args, Mapping):
+        raise tornado.web.HTTPError(400, reason="request body must be an object")
+    return args
+
+
 class SaveHandler(BaseHandler):
     @staticmethod
     async def wrap_func(handler, args):
+        """Validate payload parameters, filter invalid env IDs, and persist valid environments."""
+        if "data" not in args:
+            raise tornado.web.HTTPError(400, reason="missing required field: 'data'")
         envs = args["data"]
-        envs = [escape_eid(eid) for eid in envs]
+        if not isinstance(envs, Sequence) or isinstance(envs, (str, bytes)):
+            raise tornado.web.HTTPError(
+                400, reason="'data' must be a list of environment ids"
+            )
+        valid_envs = [
+            escape_eid(eid) for eid in envs if isinstance(eid, str) and eid.strip()
+        ]
         # this drops invalid env ids
-        ret = await save_envs_off_loop(handler, envs)
+        ret = await save_envs_off_loop(handler, valid_envs)
         handler.write(json.dumps(ret))
 
     @check_auth
     @check_readonly
     async def post(self):
-        args = tornado.escape.json_decode(
-            tornado.escape.to_basestring(self.request.body)
-        )
-        await self.wrap_func(self, args)
+        """Decode JSON request body and save environments."""
+        await self.wrap_func(self, _decode_json_body(self.request.body))
 
 
 class DataHandler(BaseHandler):
@@ -763,6 +1070,14 @@ class DataHandler(BaseHandler):
             broadcast_envs(handler)
         else:
             # Dump data to client
+            if eid not in handler.state:
+                if "win" in args and args["win"] is None:
+                    handler.write(json.dumps({}, cls=NanSafeEncoder))
+                    return
+                raise tornado.web.HTTPError(
+                    404, reason=f"environment '{eid}' not found"
+                )
+
             if "win" in args and args["win"] is None:
                 handler.write(
                     json.dumps(handler.state[eid]["jsons"], cls=NanSafeEncoder)
@@ -809,12 +1124,12 @@ class IndexHandler(BaseHandler):
                 wrap_socket=self.wrap_socket,
             )
         elif self.login_enabled:
-            items = gather_envs(self.state, self.storage)
+            # No env listing is passed: ``login.html`` has never rendered one,
+            # and building it here read the environment directory on the loop
+            # for every unauthenticated request that reached the server.
             self.render(
                 "login.html",
                 user=getpass.getuser(),
-                items=items,
-                active_item="",
                 base_url=self.base_url,
             )
 
@@ -984,13 +1299,13 @@ async def _write_experiment_metadata(handler, eid, mutate):
 
 # ---- Experiment reads, as they run on the storage worker ---- #
 #
-# Both of these read every environment file the store knows, which is the whole
-# of what the endpoints below cost. They take the DataStore rather than a live
-# ``ExperimentStore`` because the executor is handed plain positional
-# arguments, and they touch no server state, so the worker is never looking at
-# anything the loop may be editing underneath it. Reading metadata from the
-# files alone is still current: every endpoint that changes an experiment
-# persists it before it answers.
+# Each of these reads environment files -- every one the store knows, but for
+# the single-id read -- which is the whole of what the endpoints below cost.
+# They take the DataStore rather than a live ``ExperimentStore`` because the
+# executor is handed plain positional arguments, and they touch no server
+# state, so the worker is never looking at anything the loop may be editing
+# underneath it. Reading metadata from the files alone is still current: every
+# endpoint that changes an experiment persists it before it answers.
 
 
 def _search_experiments(store, query, sort_by, descending, offset, limit):
@@ -1013,26 +1328,24 @@ def _compare_experiments(store, env_ids):
     return ExperimentStore(store).compare(env_ids)
 
 
-def _decode_json_body(body):
-    """Return a request body decoded into a dict of arguments.
+def _read_stored_experiment(store, eid):
+    """Return one environment's stored experiment, or ``None`` if it has none.
 
-    Shared by the ``/experiments/*`` endpoints, whose bodies are all optional
-    JSON objects, so an empty body is read as an empty object and each handler
-    decides on its own whether the arguments it needs are missing. Anything else
-    that is not a JSON object is the caller's error: without this check,
-    malformed JSON or a bare list would surface as an unhandled exception and a
-    500 rather than a 400 naming what was wrong with the request.
+    One file rather than all of them, but a file all the same: a large
+    environment is megabytes of window data in front of the few hundred bytes
+    of metadata being asked for, and parsing it is exactly the work the loop
+    must not be doing.
     """
-    try:
-        text = tornado.escape.to_basestring(body).strip()
-        if not text:
-            return {}
-        args = tornado.escape.json_decode(text)
-    except ValueError:
-        raise tornado.web.HTTPError(400, reason="request body must be valid JSON")
-    if not isinstance(args, Mapping):
-        raise tornado.web.HTTPError(400, reason="request body must be an object")
-    return args
+    return ExperimentStore(store).get_experiment(eid)
+
+
+def _stored_experiment_map(store):
+    """Return every stored experiment, keyed by the environment it belongs to.
+
+    Keyed here rather than by the caller so that what crosses back from the
+    worker is already in the shape the overlay on the loop needs.
+    """
+    return {exp.env_id: exp for exp in ExperimentStore(store).list_experiments()}
 
 
 class ExperimentLogHandler(BaseHandler):
@@ -1483,46 +1796,86 @@ class TagsHandler(BaseHandler):
 
     @staticmethod
     def _experiment_from_env(eid, env):
-        """Return an experiment from one materialized in-memory environment."""
-        blob = env.get("experiment")
-        if not isinstance(blob, Mapping):
-            return None
-        experiment = Experiment.from_dict(blob)
-        experiment.env_id = eid
-        return experiment
+        """Return an experiment from one materialized in-memory environment.
+
+        A blob the model cannot rebuild yields ``None``, like one that is not
+        metadata at all. :meth:`_experiment_map` runs this over every resident
+        environment to answer ``GET /tags``, so a single corrupt blob raising
+        here would empty the whole tag map with a 500 rather than omit the one
+        environment it belongs to.
+        """
+        return experiment_from_blob(eid, env.get(METADATA_KEY))
 
     @staticmethod
-    def _read_experiment(handler, eid):
-        """Read one experiment without materializing unrelated environments."""
+    def _has_metadata(env):
+        """Whether ``env`` carries a metadata blob, readable or not.
+
+        What separates an env the store has simply never been told about from
+        one whose metadata is present but will not rebuild. The two read the
+        same through :meth:`_experiment_from_env` — both ``None`` — but only
+        the first may be answered from storage.
+        """
+        return env.get(METADATA_KEY) is not None
+
+    @staticmethod
+    async def _read_experiment(handler, eid):
+        """Read one experiment without materializing unrelated environments.
+
+        An env the server is already holding answers from memory, on the loop,
+        for nothing. Only the fall-through goes to disk, and it goes there on
+        the storage worker: reading it here would park the loop behind a file
+        read for the whole of every other request the server has in flight.
+        """
         env = handler.state.get(eid)
-        if env is None or (isinstance(env, LazyEnvData) and not env.is_loaded):
-            return ExperimentStore(handler.storage).get_experiment(eid)
-        experiment = TagsHandler._experiment_from_env(eid, env)
-        if experiment is not None:
-            return experiment
-        return ExperimentStore(handler.storage).get_experiment(eid)
+        if env is not None and not (isinstance(env, LazyEnvData) and not env.is_loaded):
+            experiment = TagsHandler._experiment_from_env(eid, env)
+            if experiment is not None:
+                return experiment
+            if TagsHandler._has_metadata(env):
+                # A materialized env is the version being served, so its
+                # metadata is the current one even when it cannot be read.
+                # Falling through to storage would answer with whatever the
+                # last successful save left on disk — an older run, reported
+                # as this one's tags. "No readable experiment" is the honest
+                # answer, and the one the unreadable resident blob supports.
+                return None
+        return await run_on_storage_executor(
+            handler, _read_stored_experiment, handler.storage, eid
+        )
 
     @staticmethod
-    def _experiment_map(handler):
-        """Return stored experiments overlaid with materialized state only."""
-        store = ExperimentStore(handler.storage)
-        experiments = {exp.env_id: exp for exp in store.list_experiments()}
+    async def _experiment_map(handler):
+        """Return stored experiments overlaid with materialized state only.
+
+        The overlay is applied after the read rather than before it, so an env
+        the loop tagged while the worker was reading is the version that
+        answers: the worker's copy is a snapshot of the files as they were when
+        it started, and the live env is what the server is serving now.
+        """
+        experiments = await run_on_storage_executor(
+            handler, _stored_experiment_map, handler.storage
+        )
         for eid, env in handler.state.items():
             if isinstance(env, LazyEnvData) and not env.is_loaded:
                 continue
             experiment = TagsHandler._experiment_from_env(eid, env)
             if experiment is not None:
                 experiments[eid] = experiment
+            elif TagsHandler._has_metadata(env):
+                # As in :meth:`_read_experiment`: the stored entry underneath
+                # an unreadable resident blob is stale, so drop it rather than
+                # publish it as the env's current tags.
+                experiments.pop(eid, None)
         return experiments
 
     @staticmethod
-    def _write_tags(handler, eid=None):
+    async def _write_tags(handler, eid=None):
         if eid is not None:
-            experiment = TagsHandler._read_experiment(handler, eid)
+            experiment = await TagsHandler._read_experiment(handler, eid)
             tags = tags_to_mapping(experiment.tags) if experiment else {}
             handler.write_json(tags)
             return
-        experiments = TagsHandler._experiment_map(handler)
+        experiments = await TagsHandler._experiment_map(handler)
         tag_map = {
             env_id: tags_to_mapping(experiment.tags)
             for env_id, experiment in experiments.items()
@@ -1540,7 +1893,7 @@ class TagsHandler(BaseHandler):
 
         if action == "get":
             eid = extract_eid(args) if args.get("eid") is not None else None
-            TagsHandler._write_tags(handler, eid)
+            await TagsHandler._write_tags(handler, eid)
             return
 
         if handler.readonly:

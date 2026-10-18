@@ -18,6 +18,8 @@ const {
 
 const envmodal = 'div[aria-label="Environment Management Modal"] ';
 const envbutton = 'button[title="Manage Environments"] ';
+const envselecttrigger = envmodal + 'button.env-select-trigger';
+const envselectpanel = envmodal + '#env-select-panel';
 const viewmodal = 'div[aria-label="Layout Views Management Modal"] ';
 const viewbutton = 'button[title="Manage Views"] ';
 const viewselect = 'div[aria-label="View:"] ';
@@ -28,6 +30,23 @@ async function dragMouse(page, locator, clientX, clientY) {
   await page.mouse.down();
   await page.mouse.move(clientX, clientY);
   await page.mouse.up();
+}
+
+async function openEnvSelect(page) {
+  const panel = page.locator(envselectpanel);
+  if (!(await panel.isVisible())) {
+    await page.locator(envselecttrigger).click();
+    await panel.waitFor({ state: 'visible' });
+  }
+  return panel;
+}
+
+async function closeEnvSelect(page) {
+  const panel = page.locator(envselectpanel);
+  if (await panel.isVisible()) {
+    await page.locator(envselecttrigger).click();
+    await panel.waitFor({ state: 'detached' });
+  }
 }
 
 function paneByTitle(page, title) {
@@ -78,6 +97,12 @@ test.describe.serial('Test Env Modal', () => {
     await page.locator('button', { hasText: 'fork' }).click();
     await page.locator(envmodal).press('Escape');
 
+    // create a third fork for filtered Select All testing
+    await page.locator(envbutton).click();
+    await page.locator(envmodal + 'input[type="text"]').fill(env + '_fork3');
+    await page.locator('button', { hasText: 'fork' }).click();
+    await page.locator(envmodal).press('Escape');
+
     // check if fork is still the old one
     await closeEnvs(page);
     await openEnv(page, env + '_fork');
@@ -93,28 +118,198 @@ test.describe.serial('Test Env Modal', () => {
     ).toContainText('Changed text.');
   });
 
-  test('Remove Env', async ({ page }) => {
-    // batch delete both forks at once
+  test('Env delete selector opens as a dropdown and keeps hidden picks', async ({
+    page,
+  }) => {
     await page.locator(envbutton).click();
-    await page
-      .locator(envmodal + `input[type="checkbox"][value="${env}_fork"]`)
-      .check();
+
+    // the list stays collapsed until the trigger is clicked
+    await expect(page.locator(envselectpanel)).toHaveCount(0);
+    await expect(page.locator(envselecttrigger)).toContainText(
+      'Select environments to delete'
+    );
+
+    await openEnvSelect(page);
+    const filterInput = page.getByLabel('Filter environments');
+    await expect(filterInput).toBeFocused();
+
+    // a pick made under one filter survives a different filter
+    await filterInput.fill(env + '_fork2');
     await page
       .locator(envmodal + `input[type="checkbox"][value="${env}_fork2"]`)
       .check();
+    await filterInput.fill(env + '_fork3');
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork2"]`)
+    ).toHaveCount(0);
+    await page
+      .locator(envmodal + `input[type="checkbox"][value="${env}_fork3"]`)
+      .check();
+    await expect(page.locator(envselectpanel)).toContainText('2 selected');
+    await expect(page.locator(envselectpanel)).toContainText(
+      '1 hidden by the filter'
+    );
+    await expect(page.locator(envselecttrigger)).toContainText(env + '_fork2');
+    await expect(page.locator(envselecttrigger)).toContainText(env + '_fork3');
+
+    // arrow keys step through Select All as well as the options
+    await filterInput.press('ArrowDown');
+    await expect(page.getByLabel('Select All')).toBeFocused();
+    await page.keyboard.press('ArrowDown');
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork3"]`)
+    ).toBeFocused();
+    await page.keyboard.press('ArrowUp');
+    await expect(page.getByLabel('Select All')).toBeFocused();
+
+    // shift+tab hands focus to the trigger; escape still closes the dropdown
+    await filterInput.press('Shift+Tab');
+    await expect(page.locator(envselecttrigger)).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(page.locator(envselectpanel)).toHaveCount(0);
+    await expect(page.locator(envmodal)).toBeVisible();
+    await openEnvSelect(page);
+
+    // escape closes the dropdown only; the modal stays open
+    await filterInput.press('Escape');
+    await expect(page.locator(envselectpanel)).toHaveCount(0);
+    await expect(page.locator(envmodal)).toBeVisible();
+    await expect(page.locator(envselecttrigger)).toBeFocused();
+
+    await page.locator(envmodal).press('Escape');
+    await expect(page.locator(envmodal)).toHaveCount(0);
+  });
+
+  test('Remove Env', async ({ page }) => {
+    // filter to one environment and delete it individually
+    await page.locator(envbutton).click();
+    await openEnvSelect(page);
+    const filterInput = page.getByLabel('Filter environments');
+    await filterInput.fill(env + '_fork2');
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork2"]`)
+    ).toBeVisible();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork"]`)
+    ).toHaveCount(0);
+    await page
+      .locator(envmodal + `input[type="checkbox"][value="${env}_fork2"]`)
+      .check();
+    await closeEnvSelect(page);
     await page.locator('button', { hasText: 'Delete Selected' }).click();
+    await expect(page.locator(envmodal)).toBeVisible();
+    await expect(
+      page.locator('.visdom-toast-success', {
+        hasText: `Successfully deleted environment "${env}_fork2".`,
+      })
+    ).toBeVisible();
+
+    // Select env before filtering to verify it remains checked across filter
+    // operations. The filter and the checkboxes live inside the dropdown, so
+    // it has to be open before either can be reached.
+    await openEnvSelect(page);
+    await filterInput.fill('');
+    await page
+      .locator(envmodal + `input[type="checkbox"][value="${env}"]`)
+      .check();
+
+    // Select All applies only to the remaining filtered environments
+    await filterInput.fill(env + '_fork');
+    await page.getByLabel('Select All').check();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork"]`)
+    ).toBeChecked();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork3"]`)
+    ).toBeChecked();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}"]`)
+    ).toHaveCount(0);
+
+    // Unchecking Select All deselects only the visible filtered environments
+    await page.getByLabel('Select All').uncheck();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork"]`)
+    ).not.toBeChecked();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork3"]`)
+    ).not.toBeChecked();
+
+    // Filter back to env and assert its checkbox remains checked
+    await filterInput.fill(env);
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}"]`)
+    ).toBeChecked();
+    await page
+      .locator(envmodal + `input[type="checkbox"][value="${env}"]`)
+      .uncheck();
+
+    // Verify selections persist across filter changes
+    await page
+      .locator(envmodal + `input[type="checkbox"][value="${env}_fork"]`)
+      .check();
+    await filterInput.fill(env + '_fork3');
+    await page.getByLabel('Select All').check();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork3"]`)
+    ).toBeChecked();
+    await filterInput.fill('');
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork"]`)
+    ).toBeChecked();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}_fork3"]`)
+    ).toBeChecked();
+    await expect(
+      page.locator(envmodal + `input[type="checkbox"][value="${env}"]`)
+    ).not.toBeChecked();
+
+    await closeEnvSelect(page);
+    await page.locator('button', { hasText: 'Delete Selected' }).click();
+    await expect(page.locator(envmodal)).toBeVisible();
+    await expect(
+      page.locator('.visdom-toast-success', {
+        hasText: 'Successfully deleted 2 environments.',
+      })
+    ).toBeVisible();
+
+    // deleting the active environment falls back to main without closing
+    await openEnvSelect(page);
+    await filterInput.fill(env);
+    const activeEnvCheckbox = page.locator(
+      envmodal + `input[type="checkbox"][value="${env}"]`
+    );
+    await expect(activeEnvCheckbox).toBeVisible();
+    await activeEnvCheckbox.check();
+    await closeEnvSelect(page);
+    await page.locator('button', { hasText: 'Delete Selected' }).click();
+    await expect(page.locator(envmodal)).toBeVisible();
+    await expect(page.getByLabel('Environment name')).toHaveValue('main');
+    await expect(
+      page.locator('.visdom-toast-success', {
+        hasText: `Successfully deleted environment "${env}".`,
+      })
+    ).toBeVisible();
+
+    await page.locator(envmodal).press('Escape');
     await expect(page.locator(envmodal)).toHaveCount(0);
 
     await page.locator('.rc-tree-select').click();
     await expandAllEnvGroups(page);
     const tree = page.locator('.rc-tree-select-tree');
-    await expect(tree.locator(`span[title="${env}"]`)).toBeVisible({
+    await expect(tree.locator('span[title="main"]')).toBeVisible({
+      timeout: 5000,
+    });
+    await expect(tree.locator(`span[title="${env}"]`)).toHaveCount(0, {
       timeout: 5000,
     });
     await expect(tree.locator(`span[title="${env}_fork"]`)).toHaveCount(0, {
       timeout: 5000,
     });
     await expect(tree.locator(`span[title="${env}_fork2"]`)).toHaveCount(0, {
+      timeout: 5000,
+    });
+    await expect(tree.locator(`span[title="${env}_fork3"]`)).toHaveCount(0, {
       timeout: 5000,
     });
     await closeEnvDropdown(page);
